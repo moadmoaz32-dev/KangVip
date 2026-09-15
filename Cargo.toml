@@ -22,6 +22,9 @@ crossbeam-channel = "0.5.12"
 crc32fast = "1.3.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# KHAI BÁO DÀNH RIÊNG CHO FILE build.rs NẰM Ở ĐÂY:
+[build-dependencies]
 cc = "1.0"
 
 [profile.release]
