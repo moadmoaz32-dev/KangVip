@@ -35,56 +35,16 @@ static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 static ALREADY_FOUND: AtomicBool = AtomicBool::new(false);
 
 // =========================================================================
-// [BƯỚC 1]: KHAI BÁO CẤU TRÚC BỘ NHỚ FFI SO VỚI C++
+// KHAI BÁO LIÊN KẾT FFI ĐẾN HẠT NHÂN C++ MONTGOMERY
 // =========================================================================
-#[repr(C)]
-pub struct U256_SoA {
-    pub l0: *mut u64,
-    pub l1: *mut u64,
-    pub l2: *mut u64,
-    pub l3: *mut u64,
-}
-
 extern "C" {
-    // Hàm này phải khớp chính xác với tên trong file core_simd.cpp của bạn
-    fn simd_add_mod_p_soa(a: *const U256_SoA, b: *const U256_SoA, res: *mut U256_SoA, batch_size: usize);
-}
-
-// Hàm kiểm tra an toàn bộ nhớ (Chạy 1 lần khi khởi động)
-fn test_ffi_simd() {
-    println!("[*] Đang kiểm tra liên kết bộ nhớ C++ FFI (AVX2 Struct-of-Arrays)...");
-    let batch = 1024;
-    
-    // Khởi tạo mảng phẳng chứa 1024 số giá trị cực lớn để test tràn số (Carry)
-    let mut a_l0 = vec![0xFFFFFFFFFFFFFFFFu64; batch];
-    let mut a_l1 = vec![0u64; batch];
-    let mut a_l2 = vec![0u64; batch];
-    let mut a_l3 = vec![0u64; batch];
-
-    let mut b_l0 = vec![2u64; batch];
-    let mut b_l1 = vec![0u64; batch];
-    let mut b_l2 = vec![0u64; batch];
-    let mut b_l3 = vec![0u64; batch];
-
-    let mut res_l0 = vec![0u64; batch];
-    let mut res_l1 = vec![0u64; batch];
-    let mut res_l2 = vec![0u64; batch];
-    let mut res_l3 = vec![0u64; batch];
-
-    let soa_a = U256_SoA { l0: a_l0.as_mut_ptr(), l1: a_l1.as_mut_ptr(), l2: a_l2.as_mut_ptr(), l3: a_l3.as_mut_ptr() };
-    let soa_b = U256_SoA { l0: b_l0.as_mut_ptr(), l1: b_l1.as_mut_ptr(), l2: b_l2.as_mut_ptr(), l3: b_l3.as_mut_ptr() };
-    let mut soa_res = U256_SoA { l0: res_l0.as_mut_ptr(), l1: res_l1.as_mut_ptr(), l2: res_l2.as_mut_ptr(), l3: res_l3.as_mut_ptr() };
-
-    unsafe {
-        simd_add_mod_p_soa(&soa_a, &soa_b, &mut soa_res, batch);
-    }
-    
-    // Kiểm tra logic toán: 0xFFFFFFFFFFFFFFFF + 2 = 1 (Nhớ 1 sang Limb 1)
-    if res_l0[0] == 1 && res_l1[0] == 1 {
-        println!("✅ BÀI TEST C++ FFI AVX2 THÀNH CÔNG! Giao tiếp bộ nhớ an toàn tuyệt đối.");
-    } else {
-        println!("⚠️ CẢNH BÁO: Toán học C++ tính sai. Vui lòng kiểm tra lại core_simd.cpp!");
-    }
+    fn c_point_update(
+        px: *const u64, py: *const u64,
+        qx: *const u64, qy: *const u64,
+        inv: *const u64,
+        rx: *mut u64, ry: *mut u64,
+        batch_size: usize
+    );
 }
 // =========================================================================
 
@@ -232,6 +192,12 @@ fn worker_loop(
     let mut scratch_pad = vec![Fq::zero(); K_BATCH];
     let mut p_x_limbs_cache = vec![[0u64; 4]; K_BATCH];
 
+    // Các mảng phẳng chuẩn bị cho C++
+    let mut q_x = vec![Fq::zero(); K_BATCH];
+    let mut q_y = vec![Fq::zero(); K_BATCH];
+    let mut r_x = vec![Fq::zero(); K_BATCH];
+    let mut r_y = vec![Fq::zero(); K_BATCH];
+
     let max_distance = if sub_bits >= 255 { Fr::from(-1i8) } else { Fr::from(2u64).pow([sub_bits as u64]) };
 
     let mut respawn_point = |i: usize, rng: &mut Xoshiro256PlusPlus, p_x: &mut [Fq], p_y: &mut [Fq], sc: &mut [Fr], tc: &mut [i8], dist: &mut [Fr], p_x_limbs_cache: &mut [[u64; 4]]| {
@@ -258,31 +224,50 @@ fn worker_loop(
             let mut x_limbs = p_x_limbs_cache[i];
             let mut mix = x_limbs[0] ^ x_limbs[1].rotate_left(17) ^ x_limbs[2].rotate_left(33) ^ x_limbs[3].rotate_left(51);
             jump_indices[i] = (mix as usize) & JUMP_MASK;
-            denominators[i] = jump_points[jump_indices[i]].x - p_x[i];
+            
+            let pt = &jump_points[jump_indices[i]];
+            q_x[i] = pt.x;
+            q_y[i] = pt.y;
+            denominators[i] = pt.x - p_x[i];
             
             while denominators[i].is_zero() { 
                 respawn_point(i, &mut rng, &mut p_x, &mut p_y, &mut scalars, &mut target_coeffs, &mut walked_dist, &mut p_x_limbs_cache);
                 x_limbs = p_x_limbs_cache[i];
                 mix = x_limbs[0] ^ x_limbs[1].rotate_left(17) ^ x_limbs[2].rotate_left(33) ^ x_limbs[3].rotate_left(51);
                 jump_indices[i] = (mix as usize) & JUMP_MASK;
-                denominators[i] = jump_points[jump_indices[i]].x - p_x[i];
+                
+                let pt = &jump_points[jump_indices[i]];
+                q_x[i] = pt.x;
+                q_y[i] = pt.y;
+                denominators[i] = pt.x - p_x[i];
             }
         }
 
+        // Rust xử lý Batch Inversion
         batch_inversion_in_place(&mut denominators, &mut scratch_pad);
         let mut actual_hops = 0u64;
 
-        for i in 0..K_BATCH {
-            let j_idx = jump_indices[i]; let pt = &jump_points[j_idx];
-            let lambda = (pt.y - p_y[i]) * denominators[i];
-            let x_new = lambda.square() - p_x[i] - pt.x;
-            let y_new = lambda * (p_x[i] - x_new) - p_y[i];
-            
-            let s_new = scalars[i] + jump_scalars[j_idx];
-            let c_new = target_coeffs[i];
+        // [KÍCH HOẠT VŨ KHÍ C++]
+        // Truyền thẳng 5 mảng phẳng vào lõi C++ để tính toàn bộ X_new và Y_new cùng lúc
+        unsafe {
+            c_point_update(
+                p_x.as_ptr() as *const u64, p_y.as_ptr() as *const u64,
+                q_x.as_ptr() as *const u64, q_y.as_ptr() as *const u64,
+                denominators.as_ptr() as *const u64,
+                r_x.as_mut_ptr() as *mut u64, r_y.as_mut_ptr() as *mut u64,
+                K_BATCH
+            );
+        }
 
-            p_x[i] = x_new; p_y[i] = y_new; scalars[i] = s_new; target_coeffs[i] = c_new;
-            let new_limbs = x_new.into_bigint().0;
+        // Lấy kết quả từ C++ và xử lý DP
+        for i in 0..K_BATCH {
+            let j_idx = jump_indices[i];
+            
+            p_x[i] = r_x[i]; 
+            p_y[i] = r_y[i]; 
+            
+            scalars[i] = scalars[i] + jump_scalars[j_idx];
+            let new_limbs = p_x[i].into_bigint().0;
             p_x_limbs_cache[i] = new_limbs;
             actual_hops += 1;
             
@@ -290,9 +275,9 @@ fn worker_loop(
 
             if new_limbs[0].trailing_zeros() >= dp_bits {
                 let msg = DpMessage {
-                    target_coeff: c_new,
+                    target_coeff: target_coeffs[i],
                     key: DpKey { x_0: new_limbs[0], x_1: new_limbs[1], x_2: new_limbs[2], x_3: new_limbs[3] },
-                    scalar_limbs: scalar_to_limbs(s_new)
+                    scalar_limbs: scalar_to_limbs(scalars[i])
                 };
                 
                 let mut sent = false;
@@ -441,11 +426,6 @@ fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &Fixed
 }
 
 fn main() {
-    // -----------------------------------------------------------
-    // Gọi hàm Test FFI ở đây để đảm bảo an toàn trước khi chạy
-    test_ffi_simd();
-    // -----------------------------------------------------------
-
     let args = Args::parse();
     let active_cores = args.cores.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
@@ -547,7 +527,7 @@ fn main() {
     let mut worker_states = Vec::with_capacity(active_cores);
     for _ in 0..active_cores { worker_states.push(WorkerState { keys_scanned: AtomicU64::new(0) }); }
 
-    println!("\n[+] Kích hoạt {} Lõi (v8.0.0 vOW PCS THE ABSOLUTE TRUTH)...", active_cores);
+    println!("\n[+] Kích hoạt {} Lõi (v8.0.0 C++ BMI2 ACCELERATED)...", active_cores);
     std::io::stdout().flush().unwrap();
 
     let (tx_disk, rx_disk) = bounded::<DiskMsg>(300_000);
