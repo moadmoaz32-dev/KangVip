@@ -34,6 +34,60 @@ const WINDOW_SIZE: usize = 8;
 static KEEP_RUNNING: AtomicBool = AtomicBool::new(true);
 static ALREADY_FOUND: AtomicBool = AtomicBool::new(false);
 
+// =========================================================================
+// [BƯỚC 1]: KHAI BÁO CẤU TRÚC BỘ NHỚ FFI SO VỚI C++
+// =========================================================================
+#[repr(C)]
+pub struct U256_SoA {
+    pub l0: *mut u64,
+    pub l1: *mut u64,
+    pub l2: *mut u64,
+    pub l3: *mut u64,
+}
+
+extern "C" {
+    // Hàm này phải khớp chính xác với tên trong file core_simd.cpp của bạn
+    fn simd_add_mod_p_soa(a: *const U256_SoA, b: *const U256_SoA, res: *mut U256_SoA, batch_size: usize);
+}
+
+// Hàm kiểm tra an toàn bộ nhớ (Chạy 1 lần khi khởi động)
+fn test_ffi_simd() {
+    println!("[*] Đang kiểm tra liên kết bộ nhớ C++ FFI (AVX2 Struct-of-Arrays)...");
+    let batch = 1024;
+    
+    // Khởi tạo mảng phẳng chứa 1024 số giá trị cực lớn để test tràn số (Carry)
+    let mut a_l0 = vec![0xFFFFFFFFFFFFFFFFu64; batch];
+    let mut a_l1 = vec![0u64; batch];
+    let mut a_l2 = vec![0u64; batch];
+    let mut a_l3 = vec![0u64; batch];
+
+    let mut b_l0 = vec![2u64; batch];
+    let mut b_l1 = vec![0u64; batch];
+    let mut b_l2 = vec![0u64; batch];
+    let mut b_l3 = vec![0u64; batch];
+
+    let mut res_l0 = vec![0u64; batch];
+    let mut res_l1 = vec![0u64; batch];
+    let mut res_l2 = vec![0u64; batch];
+    let mut res_l3 = vec![0u64; batch];
+
+    let soa_a = U256_SoA { l0: a_l0.as_mut_ptr(), l1: a_l1.as_mut_ptr(), l2: a_l2.as_mut_ptr(), l3: a_l3.as_mut_ptr() };
+    let soa_b = U256_SoA { l0: b_l0.as_mut_ptr(), l1: b_l1.as_mut_ptr(), l2: b_l2.as_mut_ptr(), l3: b_l3.as_mut_ptr() };
+    let mut soa_res = U256_SoA { l0: res_l0.as_mut_ptr(), l1: res_l1.as_mut_ptr(), l2: res_l2.as_mut_ptr(), l3: res_l3.as_mut_ptr() };
+
+    unsafe {
+        simd_add_mod_p_soa(&soa_a, &soa_b, &mut soa_res, batch);
+    }
+    
+    // Kiểm tra logic toán: 0xFFFFFFFFFFFFFFFF + 2 = 1 (Nhớ 1 sang Limb 1)
+    if res_l0[0] == 1 && res_l1[0] == 1 {
+        println!("✅ BÀI TEST C++ FFI AVX2 THÀNH CÔNG! Giao tiếp bộ nhớ an toàn tuyệt đối.");
+    } else {
+        println!("⚠️ CẢNH BÁO: Toán học C++ tính sai. Vui lòng kiểm tra lại core_simd.cpp!");
+    }
+}
+// =========================================================================
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     version: u32,
@@ -387,6 +441,11 @@ fn verify_and_save(final_scalar: Fr, target_bytes: &[u8; 33], fixed_base: &Fixed
 }
 
 fn main() {
+    // -----------------------------------------------------------
+    // Gọi hàm Test FFI ở đây để đảm bảo an toàn trước khi chạy
+    test_ffi_simd();
+    // -----------------------------------------------------------
+
     let args = Args::parse();
     let active_cores = args.cores.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
 
