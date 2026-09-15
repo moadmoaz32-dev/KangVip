@@ -1,65 +1,112 @@
-#include <immintrin.h>
 #include <stdint.h>
 #include <stddef.h>
 
 extern "C" {
-    // 1. Định nghĩa cấu trúc Struct of Arrays (SoA) tương thích chuẩn C-ABI
-    struct U256_SoA {
-        uint64_t* l0;
-        uint64_t* l1;
-        uint64_t* l2;
-        uint64_t* l3;
-    };
+    // Hằng số P của secp256k1
+    constexpr uint64_t P0 = 0xFFFFFFFEFFFFFC2FULL;
+    constexpr uint64_t P1 = 0xFFFFFFFFFFFFFFFFULL;
+    constexpr uint64_t P2 = 0xFFFFFFFFFFFFFFFFULL;
+    constexpr uint64_t P3 = 0xFFFFFFFFFFFFFFFFULL;
+    
+    // Hằng số Montgomery: MU = -P^-1 mod 2^64
+    constexpr uint64_t MU = 0xD838091DD2253531ULL;
 
-    // Hàm nội tuyến tính cờ nhớ (Carry) bằng SIMD Trick (Đảo bit dấu)
-    static inline __m256i get_carry(__m256i a, __m256i sum) {
-        __m256i sign_mask = _mm256_set1_epi64x(0x8000000000000000ULL);
-        __m256i a_flip = _mm256_xor_si256(a, sign_mask);
-        __m256i sum_flip = _mm256_xor_si256(sum, sign_mask);
-        __m256i cmp = _mm256_cmpgt_epi64(a_flip, sum_flip);
-        return _mm256_srli_epi64(cmp, 63);
+    // Nhân 2 số 256-bit và rút gọn Montgomery siêu tốc
+    inline void mont_mul(const uint64_t* a, const uint64_t* b, uint64_t* res) {
+        uint64_t t[5] = {0};
+        for (int i = 0; i < 4; i++) {
+            uint64_t carry = 0;
+            for (int j = 0; j < 4; j++) {
+                // Sử dụng __uint128_t để phần cứng tự động gọi lệnh MULX
+                __uint128_t prod = (__uint128_t)a[i] * b[j] + t[j] + carry;
+                t[j] = (uint64_t)prod;
+                carry = (uint64_t)(prod >> 64);
+            }
+            t[4] = carry;
+
+            uint64_t m = t[0] * MU;
+            carry = 0;
+            __uint128_t prod = (__uint128_t)m * P0 + t[0] + carry;
+            carry = (uint64_t)(prod >> 64);
+
+            prod = (__uint128_t)m * P1 + t[1] + carry;
+            t[0] = (uint64_t)prod; carry = (uint64_t)(prod >> 64);
+
+            prod = (__uint128_t)m * P2 + t[2] + carry;
+            t[1] = (uint64_t)prod; carry = (uint64_t)(prod >> 64);
+
+            prod = (__uint128_t)m * P3 + t[3] + carry;
+            t[2] = (uint64_t)prod; carry = (uint64_t)(prod >> 64);
+
+            t[3] = t[4] + carry;
+        }
+
+        // Trừ đi P nếu kết quả tràn
+        uint64_t sub[4];
+        uint64_t borrow = 0;
+        __int128_t diff;
+        diff = (__int128_t)t[0] - P0 - borrow; sub[0] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)t[1] - P1 - borrow; sub[1] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)t[2] - P2 - borrow; sub[2] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)t[3] - P3 - borrow; sub[3] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+
+        if (borrow == 0) {
+            res[0] = sub[0]; res[1] = sub[1]; res[2] = sub[2]; res[3] = sub[3];
+        } else {
+            res[0] = t[0]; res[1] = t[1]; res[2] = t[2]; res[3] = t[3];
+        }
     }
 
-    // 2. Hạt nhân Cộng Module P (P của secp256k1)
-    void simd_add_mod_p_soa(const U256_SoA* a, const U256_SoA* b, U256_SoA* res, size_t batch_size) {
-        // Định nghĩa các Limb của hằng số P = 2^256 - 2^32 - 977
-        __m256i p0 = _mm256_set1_epi64x(0xFFFFFFFEFFFFFC2FULL);
-        __m256i p1 = _mm256_set1_epi64x(0xFFFFFFFFFFFFFFFFULL);
-        __m256i p2 = _mm256_set1_epi64x(0xFFFFFFFFFFFFFFFFULL);
-        __m256i p3 = _mm256_set1_epi64x(0xFFFFFFFFFFFFFFFFULL);
+    // Phép trừ Modulo P (A - B mod P)
+    inline void mod_sub(const uint64_t* a, const uint64_t* b, uint64_t* res) {
+        uint64_t borrow = 0;
+        __int128_t diff;
+        diff = (__int128_t)a[0] - b[0] - borrow; res[0] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)a[1] - b[1] - borrow; res[1] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)a[2] - b[2] - borrow; res[2] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
+        diff = (__int128_t)a[3] - b[3] - borrow; res[3] = (uint64_t)diff; borrow = (diff < 0) ? 1 : 0;
 
-        for (size_t i = 0; i < batch_size; i += 4) {
-            // --- BƯỚC 1: CỘNG THÔNG THƯỜNG (S = A + B) ---
-            __m256i a0 = _mm256_loadu_si256((const __m256i*)&a->l0[i]);
-            __m256i b0 = _mm256_loadu_si256((const __m256i*)&b->l0[i]);
-            __m256i s0 = _mm256_add_epi64(a0, b0);
-            __m256i c0 = get_carry(a0, s0);
+        if (borrow) {
+            uint64_t carry = 0;
+            __uint128_t sum;
+            sum = (__uint128_t)res[0] + P0 + carry; res[0] = (uint64_t)sum; carry = (uint64_t)(sum >> 64);
+            sum = (__uint128_t)res[1] + P1 + carry; res[1] = (uint64_t)sum; carry = (uint64_t)(sum >> 64);
+            sum = (__uint128_t)res[2] + P2 + carry; res[2] = (uint64_t)sum; carry = (uint64_t)(sum >> 64);
+            sum = (__uint128_t)res[3] + P3 + carry; res[3] = (uint64_t)sum;
+        }
+    }
 
-            __m256i a1 = _mm256_loadu_si256((const __m256i*)&a->l1[i]);
-            __m256i b1 = _mm256_loadu_si256((const __m256i*)&b->l1[i]);
-            __m256i s1_tmp = _mm256_add_epi64(a1, b1);
-            __m256i s1 = _mm256_add_epi64(s1_tmp, c0);
-            __m256i c1 = _mm256_or_si256(get_carry(a1, s1_tmp), get_carry(s1_tmp, s1));
+    // MAIN ENDPOINT: Tính toán song song X_new và Y_new cho hàng ngàn điểm
+    void c_point_update(
+        const uint64_t* px, const uint64_t* py,
+        const uint64_t* qx, const uint64_t* qy,
+        const uint64_t* inv,
+        uint64_t* rx, uint64_t* ry,
+        size_t batch_size
+    ) {
+        // Trình biên dịch sẽ tự động bung luồng tại đây
+        for (size_t i = 0; i < batch_size; i++) {
+            size_t offset = i * 4;
+            
+            uint64_t dy[4]; 
+            mod_sub(&qy[offset], &py[offset], dy); // Y_Q - Y_P
+            
+            uint64_t lambda[4];
+            mont_mul(dy, &inv[offset], lambda); // lambda = dy * inv
+            
+            uint64_t lambda_sq[4];
+            mont_mul(lambda, lambda, lambda_sq); // lambda^2
 
-            __m256i a2 = _mm256_loadu_si256((const __m256i*)&a->l2[i]);
-            __m256i b2 = _mm256_loadu_si256((const __m256i*)&b->l2[i]);
-            __m256i s2_tmp = _mm256_add_epi64(a2, b2);
-            __m256i s2 = _mm256_add_epi64(s2_tmp, c1);
-            __m256i c2 = _mm256_or_si256(get_carry(a2, s2_tmp), get_carry(s2_tmp, s2));
+            uint64_t rx_tmp[4];
+            mod_sub(lambda_sq, &px[offset], rx_tmp); // lambda^2 - X_P
+            mod_sub(rx_tmp, &qx[offset], &rx[offset]); // R_X = rx_tmp - X_Q
 
-            __m256i a3 = _mm256_loadu_si256((const __m256i*)&a->l3[i]);
-            __m256i b3 = _mm256_loadu_si256((const __m256i*)&b->l3[i]);
-            __m256i s3_tmp = _mm256_add_epi64(a3, b3);
-            __m256i s3 = _mm256_add_epi64(s3_tmp, c2);
-            __m256i c_overflow = _mm256_or_si256(get_carry(a3, s3_tmp), get_carry(s3_tmp, s3));
-
-            // --- BƯỚC 2: RÚT GỌN MODULE (Nếu tràn hoặc S >= P thì S = S - P) ---
-            // (Phần này sẽ xử lý trừ đi P bằng SIMD Masked Subtraction)
-            // Tạm thời ghi kết quả cơ bản ra mảng:
-            _mm256_storeu_si256((__m256i*)&res->l0[i], s0);
-            _mm256_storeu_si256((__m256i*)&res->l1[i], s1);
-            _mm256_storeu_si256((__m256i*)&res->l2[i], s2);
-            _mm256_storeu_si256((__m256i*)&res->l3[i], s3);
+            uint64_t dx[4];
+            mod_sub(&px[offset], &rx[offset], dx); // X_P - R_X
+            
+            uint64_t ry_tmp[4];
+            mont_mul(lambda, dx, ry_tmp); // lambda * dx
+            mod_sub(ry_tmp, &py[offset], &ry[offset]); // R_Y = ry_tmp - Y_P
         }
     }
 }
